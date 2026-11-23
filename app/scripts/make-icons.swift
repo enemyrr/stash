@@ -17,52 +17,112 @@ func linear(_ context: CGContext, _ colors: [CGColor], from: CGPoint, to: CGPoin
 	context.drawLinearGradient(gradient, start: from, end: to, options: [])
 }
 
-/// A drive seen from the front: a rounded body with a seam, vents, and a status light. `rect` is the body's frame.
-func drawDrive(_ context: CGContext, in rect: CGRect, onDark: Bool) {
-	let radius = rect.height * 0.22
-	let body = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+/// The drive's shape: a rounded body split by a seam, with vents and a status light on the lower panel.
+/// `pixels` is the output size, so thin details keep at least one device pixel at 16 and 32 px.
+struct Drive {
+	let rect: CGRect
+	let pixels: CGFloat
 
-	context.saveGState()
-	context.setShadow(offset: CGSize(width: 0, height: -rect.height * 0.06), blur: rect.height * 0.16, color: color(0x000000, onDark ? 0.35 : 0.3))
-	context.addPath(body)
+	init(rect: CGRect, pixels: CGFloat) {
+		self.pixels = pixels
+		self.rect = pixels <= 64 ? Drive.snap(rect, 1024 / pixels) : rect
+	}
+
+	/// Rounds `rect` to whole device pixels, so small sizes render sharp edges instead of gray rows.
+	static func snap(_ rect: CGRect, _ unit: CGFloat) -> CGRect {
+		let minX = (rect.minX / unit).rounded() * unit, minY = (rect.minY / unit).rounded() * unit
+		let maxX = (rect.maxX / unit).rounded() * unit, maxY = (rect.maxY / unit).rounded() * unit
+		return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+	}
+
+	var unit: CGFloat { 1024 / pixels }
+	var body: CGPath {
+		let radius = rect.height * 0.22
+		return CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+	}
+	var seam: CGRect {
+		let seam = CGRect(x: rect.minX, y: rect.minY + rect.height * 0.36, width: rect.width, height: max(rect.height * 0.035, unit))
+		return pixels <= 64 ? Drive.snap(seam, unit) : seam
+	}
+	var vents: [CGRect] {
+		guard pixels >= 64 else { return [] }
+		let width = rect.height * 0.05
+		return (0..<5).map { index in
+			CGRect(x: rect.minX + rect.height * 0.32 + CGFloat(index) * width * 2.1, y: rect.minY + rect.height * 0.145, width: width, height: rect.height * 0.07)
+		}
+	}
+	var light: CGRect {
+		let size = max(rect.height * 0.1, unit)
+		let light = CGRect(x: rect.maxX - rect.height * 0.32 - size / 2, y: rect.minY + rect.height * 0.18 - size / 2, width: size, height: size)
+		return pixels <= 64 ? Drive.snap(light, unit) : light
+	}
+
+	func fillVents(_ context: CGContext) {
+		for vent in vents {
+			context.addPath(CGPath(roundedRect: vent, cornerWidth: vent.width / 2, cornerHeight: vent.width / 2, transform: nil))
+		}
+		context.fillPath()
+	}
+}
+
+/// The app icon's drive: a flat white glyph with the seam, vents, and status light cut out of it.
+func drawDriveGlyph(_ context: CGContext, _ drive: Drive) {
+	context.beginTransparencyLayer(auxiliaryInfo: nil)
+	context.addPath(drive.body)
 	context.setFillColor(color(0xFFFFFF))
 	context.fillPath()
-	context.restoreGState()
+	context.setBlendMode(.destinationOut)
+	context.setFillColor(color(0x000000))
+	context.fill(drive.seam)
+	drive.fillVents(context)
+	context.setFillColor(color(0x000000, 0.75))
+	context.fillEllipse(in: drive.light)
+	context.endTransparencyLayer()
+}
 
+/// The volume icon's drive: a near-black body with light details, in the app icon's palette.
+func drawDriveObject(_ context: CGContext, _ drive: Drive) {
+	let rect = drive.rect
 	context.saveGState()
-	context.addPath(body)
-	context.clip()
-	linear(context, [color(0xFFFFFF), color(0xDDE3EC)], from: CGPoint(x: 0, y: rect.maxY), to: CGPoint(x: 0, y: rect.minY))
-	// Lower panel below the seam.
-	let seam = rect.minY + rect.height * 0.36
-	context.setFillColor(color(0xC9D1DD))
-	context.fill(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: seam - rect.minY))
-	context.setFillColor(color(0xFFFFFF, 0.9))
-	context.fill(CGRect(x: rect.minX, y: seam, width: rect.width, height: rect.height * 0.018))
-	context.restoreGState()
-	context.addPath(body)
-	context.setStrokeColor(color(0x1E293B, 0.12))
-	context.setLineWidth(rect.height * 0.01)
-	context.strokePath()
-
-	// Vents on the lower panel.
-	let ventHeight = rect.height * 0.07
-	let ventWidth = rect.height * 0.05
-	for index in 0..<5 {
-		let x = rect.minX + rect.height * 0.32 + CGFloat(index) * ventWidth * 2.1
-		let vent = CGRect(x: x, y: rect.minY + rect.height * 0.145, width: ventWidth, height: ventHeight)
-		context.addPath(CGPath(roundedRect: vent, cornerWidth: ventWidth / 2, cornerHeight: ventWidth / 2, transform: nil))
-	}
-	context.setFillColor(color(0x8A95A8))
+	context.setShadow(offset: CGSize(width: 0, height: -rect.height * 0.05), blur: rect.height * 0.12, color: color(0x000000, 0.35))
+	context.addPath(drive.body)
+	context.setFillColor(color(0x1C1C1E))
 	context.fillPath()
+	context.restoreGState()
 
-	// Status light.
-	let light = rect.height * 0.1
-	let lightRect = CGRect(x: rect.maxX - rect.height * 0.32 - light / 2, y: rect.minY + rect.height * 0.18 - light / 2 + ventHeight / 2, width: light, height: light)
 	context.saveGState()
-	context.setShadow(offset: .zero, blur: light * 0.9, color: color(0x34C759, 0.9))
-	context.setFillColor(color(0x34C759))
-	context.fillEllipse(in: lightRect)
+	context.addPath(drive.body)
+	context.clip()
+	linear(context, [color(0x3A3A3C), color(0x2A2A2C)], from: CGPoint(x: 0, y: rect.maxY), to: CGPoint(x: 0, y: drive.seam.maxY))
+	context.setFillColor(color(0x1C1C1E))
+	context.fill(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: drive.seam.minY - rect.minY))
+	context.setFillColor(color(0xFFFFFF, 0.26))
+	context.fill(drive.seam)
+	if drive.pixels >= 64 {
+		strokeTopHighlight(context, drive.body, rect, width: drive.unit * 4, alpha: 0.3)
+	}
+	// An inner rim keeps the body's edge visible on dark backgrounds.
+	context.addPath(drive.body)
+	context.setStrokeColor(color(0xFFFFFF, drive.pixels >= 64 ? 0.14 : 0.08))
+	context.setLineWidth(max(drive.unit, 2) * 2)
+	context.strokePath()
+	context.restoreGState()
+
+	context.setFillColor(color(0xFFFFFF, 0.45))
+	drive.fillVents(context)
+	context.setFillColor(color(0xFFFFFF, 0.8))
+	context.fillEllipse(in: drive.light)
+}
+
+/// Strokes the inside edge of `path`, fading from `alpha` at the top to nothing a third of the way down.
+/// Call it inside a clip to `path`, so only the inner half of the line shows.
+func strokeTopHighlight(_ context: CGContext, _ path: CGPath, _ rect: CGRect, width: CGFloat, alpha: CGFloat) {
+	context.saveGState()
+	context.addPath(path)
+	context.setLineWidth(width)
+	context.replacePathWithStrokedPath()
+	context.clip()
+	linear(context, [color(0xFFFFFF, alpha), color(0xFFFFFF, 0)], from: CGPoint(x: 0, y: rect.maxY), to: CGPoint(x: 0, y: rect.maxY - rect.height / 3))
 	context.restoreGState()
 }
 
@@ -70,34 +130,36 @@ func render(_ size: Int, _ draw: (CGContext, CGFloat) -> Void) -> Data {
 	let context = CGContext(
 		data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
 		space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-	let scale = CGFloat(size) / 1024
-	context.scaleBy(x: scale, y: scale)
-	draw(context, scale)
+	context.scaleBy(x: CGFloat(size) / 1024, y: CGFloat(size) / 1024)
+	draw(context, CGFloat(size))
 	return NSBitmapImageRep(cgImage: context.makeImage()!).representation(using: .png, properties: [:])!
 }
 
 /// macOS app icon grid: an 824-point rounded square centered on a 1024-point canvas.
-func appIcon(_ context: CGContext, _ scale: CGFloat) {
+func appIcon(_ context: CGContext, _ pixels: CGFloat) {
 	let tile = CGRect(x: 100, y: 100, width: 824, height: 824)
 	let shape = CGPath(roundedRect: tile, cornerWidth: 185, cornerHeight: 185, transform: nil)
 	context.saveGState()
-	context.setShadow(offset: CGSize(width: 0, height: -10), blur: 28, color: color(0x000000, 0.28))
+	context.setShadow(offset: CGSize(width: 0, height: -10), blur: 28, color: color(0x000000, 0.3))
 	context.addPath(shape)
-	context.setFillColor(color(0x2F6BF2))
+	context.setFillColor(color(0x1C1C1E))
 	context.fillPath()
 	context.restoreGState()
 
 	context.saveGState()
 	context.addPath(shape)
 	context.clip()
-	linear(context, [color(0x4C8DFF), color(0x1D4ED8)], from: CGPoint(x: 0, y: tile.maxY), to: CGPoint(x: 0, y: tile.minY))
+	linear(context, [color(0x2A2A2C), color(0x1C1C1E)], from: CGPoint(x: 0, y: tile.maxY), to: CGPoint(x: 0, y: tile.minY))
+	strokeTopHighlight(context, shape, tile, width: 2 * 1024 / pixels, alpha: 0.18)
 	context.restoreGState()
 
-	drawDrive(context, in: CGRect(x: 232, y: 382, width: 560, height: 260), onDark: true)
+	// At 16 px the standard glyph is 4 px tall, too short for a seam, so it grows to 10 by 5 px.
+	let glyph = pixels <= 16 ? CGRect(x: 192, y: 384, width: 640, height: 320) : CGRect(x: 232, y: 382, width: 560, height: 260)
+	drawDriveGlyph(context, Drive(rect: glyph, pixels: pixels))
 }
 
-func volumeIconImage(_ context: CGContext, _ scale: CGFloat) {
-	drawDrive(context, in: CGRect(x: 92, y: 300, width: 840, height: 390), onDark: false)
+func volumeIconImage(_ context: CGContext, _ pixels: CGFloat) {
+	drawDriveObject(context, Drive(rect: CGRect(x: 92, y: 300, width: 840, height: 390), pixels: pixels))
 }
 
 let files = FileManager.default
