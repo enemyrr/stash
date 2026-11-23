@@ -1,0 +1,5 @@
+// Signing team and bundle ID. Override both in local.xcconfig (see local.example.xcconfig).
+DEVELOPMENT_TEAM =
+STASH_BUNDLE_ID = com.example.stash
+
+#include? "local.xcconfig"

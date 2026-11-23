@@ -1,0 +1,3 @@
+// Copy to local.xcconfig (gitignored) and fill in your own values.
+DEVELOPMENT_TEAM = ABCDE12345
+STASH_BUNDLE_ID = com.yourname.stash
