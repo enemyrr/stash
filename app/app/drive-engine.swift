@@ -8,7 +8,8 @@ protocol DriveEngine {
 	func validate(_ config: DriveConfig, secrets: DriveSecrets) async throws
 	func mount(_ config: DriveConfig) async throws
 	func unmount(_ config: DriveConfig) async throws
-	func isMounted(_ config: DriveConfig) -> Bool
+	/// Where the drive is mounted, read from the mount table.
+	func mountPoint(_ config: DriveConfig) -> URL?
 }
 
 /// Checks credentials against the bucket and mounts drives through the FSKit module, which runs the sync engine.
@@ -48,24 +49,21 @@ struct S3DriveEngine: DriveEngine {
 
 	func unmount(_ config: DriveConfig) async throws {
 		// unmount(2) returns EPERM for FSKit volumes; NSWorkspace goes through Disk Arbitration like Finder's Eject.
-		guard let path = mountPath(config) else { return }
-		try NSWorkspace.shared.unmountAndEjectDevice(at: URL(filePath: path))
+		guard let url = mountPoint(config) else { return }
+		try NSWorkspace.shared.unmountAndEjectDevice(at: url)
 	}
-
-	func isMounted(_ config: DriveConfig) -> Bool { mountPath(config) != nil }
 
 	private func resourceURL(_ config: DriveConfig) -> URL {
 		URL.applicationSupportDirectory.appending(path: "\(stashBundleID)/\(config.id.uuidString)", directoryHint: .isDirectory)
 	}
 
-	/// The mount point of the volume mounted from this drive's resource, if any.
-	private func mountPath(_ config: DriveConfig) -> String? {
+	func mountPoint(_ config: DriveConfig) -> URL? {
 		// FSKit records the resource as a file URL, e.g. file:///…/<bundle id>/<id>/.
 		let resource = resourceURL(config).absoluteString
 		var mounts: UnsafeMutablePointer<statfs>?
 		let count = Int(getmntinfo(&mounts, MNT_NOWAIT))
 		return UnsafeBufferPointer(start: mounts, count: count).lazy
 			.first { withUnsafeBytes(of: $0.f_mntfromname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } == resource }
-			.map { withUnsafeBytes(of: $0.f_mntonname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } }
+			.map { withUnsafeBytes(of: $0.f_mntonname) { URL(filePath: String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self), directoryHint: .isDirectory) } }
 	}
 }

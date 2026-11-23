@@ -46,6 +46,12 @@ To import an existing rclone crypt remote, run the app binary with `--import-rcl
 
 The arguments are the path to `rclone.conf`, the name of the remote, and the name of the drive. The remote must be a crypt remote that points at the root of an S3 bucket. If a drive with that name exists, Stash updates it. The import prints no secrets. Stash mounts the drive the next time it starts.
 
+## Use the menu bar
+
+Stash runs in the menu bar and opens at login. The icon shows a crossed-out drive when a drive is not mounted. The menu mounts, ejects, and opens each drive. **Settings…** opens the drive list.
+
+If a drive unmounts without an eject, Stash mounts it again after 2 seconds, 10 seconds, 1 minute, and then every 5 minutes. A drive that you eject in Stash, in Finder, or with `diskutil` stays ejected until you click **Mount** or Stash starts again.
+
 ## How it works
 
 The app stores drive settings in its app group container and the keys in a shared Keychain group. The FSKit module serves each drive from local state and syncs with the bucket in the background:

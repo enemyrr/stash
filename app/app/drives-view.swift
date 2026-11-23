@@ -39,7 +39,7 @@ struct DrivesView: View {
 			Section {
 				ForEach(store.drives) { drive in
 					LabeledContent {
-						Text(store.mounted.contains(drive.id) ? "Mounted" : "Not mounted")
+						Text(store.mountPoints[drive.id] != nil ? "Mounted" : "Not mounted")
 							.foregroundStyle(.secondary)
 						Button("Remove", systemImage: "trash") { removing = drive }
 							.labelStyle(.iconOnly)

@@ -1,9 +1,11 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 	let store = DriveStore()
+	private var statusItem: StatusItem?
 
 	lazy var window: NSWindow = {
 		let window = NSWindow(contentViewController: NSHostingController(rootView: DrivesView(store: store)))
@@ -14,9 +16,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}()
 
 	func applicationDidFinishLaunching(_ notification: Notification) {
-		let launch = NSAppleEventManager.shared().currentAppleEvent?.paramDescriptor(forKeyword: keyAEPropData)
-		if store.drives.isEmpty || launch?.enumCodeValue != keyAELaunchedAsLogInItem { showWindow() }
-		Task { await store.mountAll() }
+		statusItem = StatusItem(store: store) { [unowned self] in showWindow() }
+		if store.drives.isEmpty { showWindow() }
+		store.mountAll()
+		// Opens Stash at login, once. Turning it off in Login Items sticks.
+		if !UserDefaults.standard.bool(forKey: "loginItemRegistered") {
+			try? SMAppService.mainApp.register()
+			UserDefaults.standard.set(true, forKey: "loginItemRegistered")
+		}
 	}
 
 	func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
