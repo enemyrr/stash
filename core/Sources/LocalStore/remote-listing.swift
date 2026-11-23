@@ -8,7 +8,10 @@ extension LocalStore {
 	/// operation in flight, are left alone because the listing may predate their upload.
 	/// The call is a no-op, and the directory should be listed again, when a move or delete in it
 	/// completed after `listedAt`, or while the directory itself has a rename queued.
-	public func applyRemoteListing(_ dirId: Int64, entries: [RemoteEntry], listedAt: Date) throws {
+	/// Items in `protected`, such as files with writes still buffered in memory, are left alone too.
+	public func applyRemoteListing(
+		_ dirId: Int64, entries: [RemoteEntry], listedAt: Date, protected: Set<Int64> = []
+	) throws {
 		try withWriter { db in
 			let listedAt = listedAt.timeIntervalSince1970
 			guard let dir = try db.item(dirId), dir.isDirectory, dir.state != .deletedPending,
@@ -18,11 +21,12 @@ extension LocalStore {
 				$0.key.isDirectChild(of: prefix) && isValidName($0.name) && !isLocalOnlyName($0.name)
 			}
 			let keys = Set(entries.map(\.key))
-			let listing = Listing(dirId: dirId, prefix: prefix, keys: keys, listedAt: listedAt, now: Date())
+			let listing = Listing(
+				dirId: dirId, prefix: prefix, keys: keys, listedAt: listedAt, now: Date(), protected: protected)
 
 			for child in try db.liveChildren(dirId) {
 				guard let key = child.remoteKey, key.isDirectChild(of: prefix), !keys.contains(key) else { continue }
-				try applyRemoteDeletion(db, child, listedAt: listedAt)
+				try applyRemoteDeletion(db, child, listing)
 			}
 			// Directories first, so a file named like a directory finds it.
 			for entry in entries.sorted(by: { $0.isDirectory && !$1.isDirectory }) {
@@ -37,16 +41,24 @@ extension LocalStore {
 		let keys: Set<String>
 		let listedAt: Double
 		let now: Date
+		let protected: Set<Int64>
+
+		func isBusy(_ db: Connection, _ id: Int64) throws -> Bool {
+			try protected.contains(id) || db.isBusy(id, listedAt: listedAt)
+		}
 	}
 
 	private func apply(_ db: Connection, _ entry: RemoteEntry, _ listing: Listing) throws {
 		let matches = try db.query(
 			"SELECT \(Connection.itemColumns) FROM items WHERE remote_key = ?", entry.key, map: Connection.item(from:))
-		// Deleted here: the queued delete wins.
+		// Deleted here: the queued delete wins. A delete queued after a create whose reply was lost has no item with the key.
 		if matches.contains(where: { $0.state == .deletedPending }) { return }
+		let isDeleteQueued = try db.first(
+			"SELECT 1 FROM ops WHERE kind = ? AND key = ? LIMIT 1", OperationKind.delete.rawValue, entry.key) { _ in true } != nil
+		if isDeleteQueued { return }
 
 		if let local = matches.first {
-			guard try !db.isBusy(local.id, listedAt: listing.listedAt), !local.isDirectory,
+			guard try !listing.isBusy(db, local.id), !local.isDirectory,
 				local.remoteEtag != entry.etag
 			else { return }
 			if local.state.isDirty {
@@ -61,7 +73,7 @@ extension LocalStore {
 			try insertRemote(db, entry, name: entry.name, remoteName: entry.name, state: .synced, listing)
 			return
 		}
-		guard try !db.isBusy(local.id, listedAt: listing.listedAt) else { return }
+		guard try !listing.isBusy(db, local.id) else { return }
 		switch (local.isDirectory, entry.isDirectory) {
 		case (true, true):
 			// Created on both sides: one directory.
@@ -124,11 +136,11 @@ extension LocalStore {
 	}
 
 	/// The item is gone remotely. Clean items go too. Items with local work stay and are uploaded again.
-	private func applyRemoteDeletion(_ db: Connection, _ item: Item, listedAt: Double) throws {
-		guard try !db.isBusy(item.id, listedAt: listedAt) else { return }
+	private func applyRemoteDeletion(_ db: Connection, _ item: Item, _ listing: Listing) throws {
+		guard try !listing.isBusy(db, item.id) else { return }
 		if item.isDirectory {
 			for child in try db.liveChildren(item.id) where child.remoteKey != nil {
-				try applyRemoteDeletion(db, child, listedAt: listedAt)
+				try applyRemoteDeletion(db, child, listing)
 			}
 		}
 		let hasQueuedContent = try db.first(
@@ -157,6 +169,34 @@ extension LocalStore {
 				|| listing.keys.contains(listing.prefix + name) || listing.keys.contains(listing.prefix + name + "/")
 			if !isTaken { return name }
 			attempt += 1
+		}
+	}
+}
+
+/// rclone keeps a file's modification time in object metadata, which listings don't include.
+extension LocalStore {
+	/// Synced files in the directory whose metadata mtime is not known for their current remote version.
+	public func filesNeedingRemoteMtime(in dirId: Int64) throws -> [Item] {
+		try withReader { db in
+			try db.query(
+				"""
+				SELECT \(Connection.itemColumns) FROM items
+				WHERE parent_id = ? AND is_dir = 0 AND state = 0 AND remote_etag IS NOT NULL AND meta_etag IS NOT remote_etag
+				""",
+				dirId, map: Connection.item(from:))
+		}
+	}
+
+	/// Records the metadata mtime of remote version `etag`; `nil` when it has none. Ignored when the item has
+	/// changed since, here or remotely, so a local mtime is never replaced.
+	public func setRemoteMtime(_ id: Int64, etag: String, mtime: Date?) throws {
+		try withWriter { db in
+			try db.run(
+				"""
+				UPDATE items SET meta_etag = ?1, mtime = coalesce(?2, mtime), remote_mtime = coalesce(?2, remote_mtime)
+				WHERE id = ?3 AND remote_etag = ?1 AND state = 0 AND NOT EXISTS (SELECT 1 FROM ops WHERE item_id = ?3)
+				""",
+				etag, mtime?.timeIntervalSince1970, id)
 		}
 	}
 }

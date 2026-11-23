@@ -16,6 +16,7 @@ public final class SyncEngine: Sendable {
 		case notUploaded
 		case missingContent
 		case deleteFailed(count: Int)
+		case moveIncomplete(count: Int)
 	}
 
 	public let store: LocalStore
@@ -34,6 +35,8 @@ public final class SyncEngine: Sendable {
 	/// Directories not visited for this long are no longer refreshed.
 	static let visitWindow: TimeInterval = 600
 	static let maxRetryDelay: TimeInterval = 60
+	/// HEAD requests in flight per directory when reading modification times.
+	static let mtimeConcurrency = 8
 
 	private struct ChunkKey: Hashable {
 		let id: Int64
@@ -44,7 +47,8 @@ public final class SyncEngine: Sendable {
 	private struct State: Sendable {
 		var loop: Task<Void, Never>?
 		var isKicked = false
-		var runningOperations = 0
+		var workers: [Int64: Task<Void, Never>] = [:]
+		var mtimeFetches: Set<Int64> = []
 		var listings: [Int64: Task<Void, any Error>] = [:]
 		var chunks: [ChunkKey: Task<Void, any Error>] = [:]
 		/// When a chunk of the file last arrived.
@@ -77,11 +81,17 @@ public final class SyncEngine: Sendable {
 		}
 	}
 
-	public func stop() {
-		state.withLock { state in
+	/// Returns once no operation is running, so the store can be closed and reopened without a stale upload landing later.
+	public func stop() async {
+		let loop = state.withLock { state in
 			defer { state.loop = nil }
 			return state.loop
-		}?.cancel()
+		}
+		loop?.cancel()
+		await loop?.value
+		let workers = state.withLock { Array($0.workers.values) }
+		for worker in workers { worker.cancel() }
+		for worker in workers { await worker.value }
 	}
 
 	/// Runs queued operations now instead of at the next tick.
@@ -160,13 +170,55 @@ public final class SyncEngine: Sendable {
 				let remotePrefix = keys.remoteKey(prefix)
 				let result = try await client.listAll(prefix: remotePrefix.isEmpty ? nil : remotePrefix, delimiter: "/")
 				let entries = keys.entries(result, prefix: prefix, listedAt: listedAt)
-				try store.applyRemoteListing(dirId, entries: entries, listedAt: listedAt)
+				let protected = try store.children(of: dirId, limit: .max).map(\.id).filter(shouldDeferUpload)
+				try store.applyRemoteListing(dirId, entries: entries, listedAt: listedAt, protected: Set(protected))
 				noteSuccess()
+				startMtimeFetch(dirId)
 			}
 			state.withLock { $0.listedAt[dirId] = listedAt }
 		} catch {
 			noteFailure(error, "List")
 		}
+	}
+
+	/// Reads the rclone modification times of the directory's files with HEAD, in the background.
+	/// Until then they show the upload time from the listing.
+	private func startMtimeFetch(_ dirId: Int64) {
+		guard state.withLock({ $0.mtimeFetches.insert(dirId).inserted }) else { return }
+		Task.detached { [self] in
+			defer { self.state.withLock { _ = $0.mtimeFetches.remove(dirId) } }
+			let files = (try? store.filesNeedingRemoteMtime(in: dirId)) ?? []
+			await withTaskGroup(of: Void.self) { group in
+				for (index, file) in files.enumerated() {
+					if index >= Self.mtimeConcurrency { await group.next() }
+					group.addTask { await self.fetchMtime(file) }
+				}
+			}
+		}
+	}
+
+	private func fetchMtime(_ file: Item) async {
+		guard !isOffline, let key = file.remoteKey, let etag = file.remoteEtag else { return }
+		do {
+			let info = try await client.head(keys.remoteKey(key))
+			guard info.etag == etag else { return }
+			try store.setRemoteMtime(file.id, etag: etag, mtime: info.metadata["mtime"].flatMap(Self.date(rcloneMtime:)))
+			noteSuccess()
+		} catch {
+			noteFailure(error, "Head")
+		}
+	}
+
+	/// rclone's `X-Amz-Meta-Mtime`: seconds since the epoch as a decimal string, such as `1783019161.590893708`.
+	static func rcloneMtime(_ date: Date) -> String {
+		var string = String(format: "%.6f", date.timeIntervalSince1970)
+		while string.hasSuffix("0") { string.removeLast() }
+		if string.hasSuffix(".") { string.removeLast() }
+		return string
+	}
+
+	static func date(rcloneMtime string: String) -> Date? {
+		Double(string).flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil }
 	}
 
 	// MARK: Content
@@ -274,7 +326,7 @@ public final class SyncEngine: Sendable {
 	// MARK: Operations
 
 	private func startReadyOperations() {
-		let free = Self.maxOperations - state.withLock { $0.runningOperations }
+		let free = Self.maxOperations - state.withLock { $0.workers.count }
 		guard free > 0 else { return }
 		let claimed: [SyncOperation]
 		do {
@@ -285,13 +337,14 @@ public final class SyncEngine: Sendable {
 			Self.log.error("Claim failed: \(String(describing: error), privacy: .public)")
 			return
 		}
-		state.withLock { $0.runningOperations += claimed.count }
-		for op in claimed {
-			Task.detached { [self] in
-				await run(op)
-				state.withLock {
-					$0.runningOperations -= 1
-					$0.isKicked = true
+		state.withLock { state in
+			for op in claimed {
+				state.workers[op.id] = Task.detached { [self] in
+					await run(op)
+					self.state.withLock {
+						$0.workers[op.id] = nil
+						$0.isKicked = true
+					}
 				}
 			}
 		}
@@ -313,16 +366,20 @@ public final class SyncEngine: Sendable {
 		}
 	}
 
-	/// Returns the new ETag for uploads.
+	/// Returns the new ETag for uploads and touches.
 	private func perform(_ op: SyncOperation) async throws -> String? {
 		let key = keys.remoteKey(op.key)
 		switch op.kind {
 		case .upload:
-			guard let content = op.contentURL else { throw Failure.missingContent }
-			// Only a first upload of a new file checks that the key is free. A retry may follow an attempt that landed
-			// without a reply, so it overwrites: last writer wins, as for edits of existing files.
-			let isCreate = try store.item(op.itemId)?.remoteKey == nil && op.attempts == 0
-			return try await upload(content, to: key, isCreate: isCreate)
+			guard let content = op.contentURL, let item = try store.item(op.itemId) else { throw Failure.missingContent }
+			// A first upload of a new file checks that the key is free. A retry may follow an attempt that landed
+			// without a reply, so it overwrites. An edit replaces only the version it was made from; otherwise the
+			// listing that follows the failure keeps the remote version as a conflict copy.
+			let condition: Precondition? =
+				if item.remoteKey == nil { op.attempts == 0 ? .ifNoneMatch("*") : nil }
+				else if item.remoteKey == op.key, let base = op.baseEtag, !base.isEmpty { .ifMatch(base) }
+				else { nil }
+			return try await upload(content, to: key, condition: condition, mtime: item.mtime)
 		case .mkdir:
 			// S3 has no directories. A zero-byte `dir/` marker keeps empty ones; rclone lists it as a directory.
 			try await client.put(key, data: Data())
@@ -331,12 +388,22 @@ public final class SyncEngine: Sendable {
 			try await move(from: keys.remoteKey(op.fromKey ?? ""), to: key)
 			return nil
 		case .delete:
-			try await delete(key)
+			try await delete(key, itemId: op.itemId)
 			return nil
+		case .touch:
+			// A copy onto itself replaces the metadata without sending the content. A remote change since wins.
+			guard let item = try store.item(op.itemId), let etag = item.remoteEtag, item.remoteKey == op.key else { return nil }
+			do {
+				return try await client.copy(
+					from: key, to: key, sourceIfMatch: etag, updatingMetadata: ["mtime": Self.rcloneMtime(item.mtime)])
+			} catch let error as S3Error where error == .notFound || error == .preconditionFailed {
+				return nil
+			}
 		}
 	}
 
-	private func upload(_ content: URL, to key: String, isCreate: Bool) async throws -> String {
+	/// Sends the file with its mtime in rclone's metadata.
+	private func upload(_ content: URL, to key: String, condition: Precondition?, mtime: Date) async throws -> String {
 		var file = content
 		let encrypted = store.makeStagingURL()
 		defer { try? FileManager.default.removeItem(at: encrypted) }
@@ -344,48 +411,59 @@ public final class SyncEngine: Sendable {
 			try cipher.encryptFile(at: content, to: encrypted)
 			file = encrypted
 		}
-		guard isCreate else { return try await client.put(key, fileURL: file) }
+		let metadata = ["mtime": Self.rcloneMtime(mtime)]
 		// Hetzner ignores conditions on CompleteMultipartUpload, so big files check with HEAD first.
 		let size = try Int64(file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
-		guard size >= client.config.multipart.threshold else {
-			return try await client.put(key, fileURL: file, condition: .ifNoneMatch("*"))
+		if let condition, size >= client.config.multipart.threshold {
+			let current: String?
+			do {
+				current = try await client.head(key).etag
+			} catch S3Error.notFound {
+				current = nil
+			}
+			let holds = switch condition {
+			case .ifNoneMatch: current == nil
+			case let .ifMatch(etag): current == etag
+			}
+			guard holds else { throw S3Error.preconditionFailed }
 		}
-		do {
-			_ = try await client.head(key)
-			throw S3Error.preconditionFailed
-		} catch S3Error.notFound {
-			return try await client.put(key, fileURL: file)
-		}
+		return try await client.put(key, fileURL: file, metadata: metadata, condition: condition)
 	}
 
 	/// Server-side copy and delete, per object for a prefix. A missing source counts as moved.
 	/// Encrypted names are encrypted per segment, so keys below a moved prefix keep their suffix.
+	/// Only sources that were copied are deleted; the move fails if any wasn't, and the retry moves what is left.
 	private func move(from: String, to: String) async throws {
 		guard from.hasSuffix("/") else {
 			if try await copy(from, to) { try await client.delete(from) }
 			return
 		}
 		let objects = try await client.listAll(prefix: from).objects
+		var copied: [String] = []
 		for object in objects {
-			_ = try await copy(object.key, to + String(decoding: object.key.utf8.dropFirst(from.utf8.count), as: UTF8.self))
+			let destination = to + String(decoding: object.key.utf8.dropFirst(from.utf8.count), as: UTF8.self)
+			if try await copy(object.key, destination, ifMatch: object.etag) { copied.append(object.key) }
 		}
-		try await deleteKeys(objects.map(\.key))
+		try await deleteKeys(copied)
+		guard copied.count == objects.count else { throw Failure.moveIncomplete(count: objects.count - copied.count) }
 	}
 
 	/// Returns false when the source does not exist.
-	private func copy(_ source: String, _ destination: String) async throws -> Bool {
+	private func copy(_ source: String, _ destination: String, ifMatch etag: String? = nil) async throws -> Bool {
 		do {
-			try await client.copy(from: source, to: destination)
+			try await client.copy(from: source, to: destination, sourceIfMatch: etag)
 			return true
 		} catch S3Error.notFound {
 			return false
 		}
 	}
 
-	/// A key ending in `/` deletes the whole prefix. Missing keys count as deleted.
-	private func delete(_ key: String) async throws {
+	/// Deletes the object. For a directory key, ending in `/`, deletes its marker and the objects below it that the
+	/// store knows; anything else there, such as names that don't decrypt, stays. Missing keys count as deleted.
+	private func delete(_ key: String, itemId: Int64) async throws {
 		guard key.hasSuffix("/") else { return try await client.delete(key) }
-		try await deleteKeys(client.listAll(prefix: key).objects.map(\.key))
+		let known = Set(try store.remoteKeys(inSubtreeOf: itemId).map(keys.remoteKey)).union([key])
+		try await deleteKeys(client.listAll(prefix: key).objects.map(\.key).filter(known.contains))
 	}
 
 	/// Batches of 100 keep each request well inside Hetzner's time limits.

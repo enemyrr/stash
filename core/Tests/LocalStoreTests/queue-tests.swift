@@ -212,4 +212,38 @@ import Testing
 		#expect(ops.map(\.kind) == [.delete])
 		#expect(ops.first?.key == "f")
 	}
+
+	@Test func renameAfterATriedMoveQueuesASecondMove() throws {
+		let dir = makeDirectory()
+		defer { removeDirectory(dir) }
+		let store = try LocalStore(directory: dir)
+
+		let folder = try store.createDirectory(in: Item.rootId, name: "a")
+		try syncAll(store)
+		try store.rename(folder.id, to: Item.rootId, name: "b")
+		// Part of the prefix may have moved before the failure.
+		let move = try #require(try store.markInFlight(store.nextBatch(limit: 1).map(\.id)).first)
+		try store.fail(move.id, retryAfter: Date())
+		try store.rename(folder.id, to: Item.rootId, name: "c")
+
+		let ops = try store.queuedOperations()
+		#expect(ops.map(\.fromKey) == ["a/", "b/"])
+		#expect(ops.map(\.key) == ["b/", "c/"])
+	}
+
+	@Test func setMtimeQueuesATouchOnlyWithoutAPendingUpload() throws {
+		let dir = makeDirectory()
+		defer { removeDirectory(dir) }
+		let store = try LocalStore(directory: dir)
+
+		let file = try store.createFile(in: Item.rootId, name: "f")
+		try store.setMtime(file.id, to: Date(timeIntervalSince1970: 1))
+		#expect(try store.queuedOperations().map(\.kind) == [.upload])
+		try syncAll(store)
+
+		try store.setMtime(file.id, to: Date(timeIntervalSince1970: 2))
+		try store.setMtime(file.id, to: Date(timeIntervalSince1970: 3))
+		#expect(try store.queuedOperations().map(\.kind) == [.touch])
+		#expect(try store.item(file.id)?.mtime == Date(timeIntervalSince1970: 3))
+	}
 }

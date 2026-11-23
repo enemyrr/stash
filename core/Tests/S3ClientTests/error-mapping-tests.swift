@@ -9,7 +9,7 @@ struct ErrorMappingTests {
 
     @Test(arguments: [
         (404, "NoSuchKey", S3Error.notFound),
-        (404, "NoSuchUpload", .notFound),
+        (404, "NoSuchUpload", .http(status: 404, code: "NoSuchUpload", message: "m")),
         (404, "NoSuchBucket", .http(status: 404, code: "NoSuchBucket", message: "m")),
         (403, "SignatureDoesNotMatch", .accessDenied(code: "SignatureDoesNotMatch")),
         (412, "PreconditionFailed", .preconditionFailed),

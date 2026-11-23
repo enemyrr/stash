@@ -48,7 +48,8 @@ extension S3Error {
         let error = (try? XMLNode.parse(body)).flatMap { $0.name == "Error" ? $0 : nil }
         let code = error?.value("Code")
         switch status {
-        case 404 where code != "NoSuchBucket": self = .notFound
+        // A lost multipart upload is not a missing object: callers treat `.notFound` as "nothing to copy".
+        case 404 where code != "NoSuchBucket" && code != "NoSuchUpload": self = .notFound
         case 403: self = .accessDenied(code: code)
         case 304, 412: self = .preconditionFailed
         case 409: self = .conflict(code: code)

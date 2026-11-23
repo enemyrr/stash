@@ -54,14 +54,17 @@ extension LocalStore {
 			try withWriter { db -> SyncOperation? in
 				guard let op = try db.operation(id), !op.isInFlight else { return nil }
 				var contentURL: URL?
+				var baseEtag: String?
 				if op.kind == .upload {
 					let info = try db.cacheInfo(op.itemId)
 					guard info.isFullyResident else { return nil }
 					contentURL = try snapshotContent(op.itemId, size: info.size, opId: id)
+					baseEtag = info.remoteEtag
 				}
 				try db.run("UPDATE ops SET state = 1 WHERE id = ?", id)
 				var claimed = try db.operation(id)
 				claimed?.contentURL = contentURL
+				claimed?.baseEtag = baseEtag
 				return claimed
 			}
 		}
@@ -77,8 +80,9 @@ extension LocalStore {
 
 			switch op.kind {
 			case .upload, .mkdir:
+				// Uploads send the item's mtime, so the new version's metadata mtime is known.
 				try db.run(
-					"UPDATE items SET remote_key = ?, remote_etag = ?, synced_at = ? WHERE id = ?",
+					"UPDATE items SET remote_key = ?1, remote_etag = ?2, meta_etag = ?2, synced_at = ?3 WHERE id = ?4",
 					op.key, etag, now, op.itemId)
 				guard let item = try db.item(op.itemId), item.state.isDirty else { return }
 				let isSettled = try db.first(
@@ -103,6 +107,16 @@ extension LocalStore {
 				if let item = try db.item(op.itemId), item.state == .deletedPending {
 					try purgeSubtree(db, item.id)
 				}
+			case .touch:
+				// The copy made a new version of the same content: the cache stays current.
+				guard let etag else { return }
+				try db.run(
+					"""
+					UPDATE items SET cache_etag = CASE WHEN cache_etag = remote_etag THEN ?1 ELSE cache_etag END,
+						remote_etag = ?1, meta_etag = ?1, synced_at = ?2
+					WHERE id = ?3
+					""",
+					etag, now, op.itemId)
 			}
 		}
 	}
@@ -160,13 +174,14 @@ extension Connection {
 	/// - a move right after a pending move of the same item extends it, or cancels it on a round trip.
 	func enqueue(_ kind: OperationKind, itemId: Int64, key: String, fromKey: String? = nil) throws {
 		switch kind {
-		case .upload:
+		case .upload, .touch:
 			let isQueued = try first(
-				"SELECT 1 FROM ops WHERE item_id = ? AND kind = 0 AND state = 0 LIMIT 1", itemId) { _ in true } != nil
+				"SELECT 1 FROM ops WHERE item_id = ? AND kind = ? AND state = 0 LIMIT 1", itemId, kind.rawValue) { _ in true } != nil
 			if isQueued { return }
 		case .move:
+			// A move that was tried may have moved part of a prefix; retargeting it would split the subtree.
 			if let last = try first("SELECT \(Self.operationColumns) FROM ops ORDER BY id DESC LIMIT 1", map: Self.operation(from:)),
-				last.kind == .move, !last.isInFlight, last.itemId == itemId, last.key == fromKey
+				last.kind == .move, !last.isInFlight, last.attempts == 0, last.itemId == itemId, last.key == fromKey
 			{
 				if last.fromKey == key {
 					try run("DELETE FROM ops WHERE id = ?", last.id)

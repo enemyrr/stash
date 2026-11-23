@@ -127,15 +127,22 @@ public final class S3Client: Sendable {
     /// Server-side copy within the bucket. Fails with `.preconditionFailed` if the source ETag differs from
     /// `sourceIfMatch`, or if `condition` does not hold for the destination. Returns the new ETag.
     /// The source check is always enforced; some providers, such as Hetzner, ignore the destination `condition`.
+    /// `updatingMetadata` replaces those metadata entries and keeps the others, so a copy onto itself updates metadata.
     @discardableResult
     public func copy(
-        from source: String, to destination: String, sourceIfMatch: String? = nil, condition: Precondition? = nil
+        from source: String, to destination: String, sourceIfMatch: String? = nil, condition: Precondition? = nil,
+        updatingMetadata: [String: String]? = nil
     ) async throws -> String {
-        let info = try await head(source, ifMatch: sourceIfMatch)
+        var info = try await head(source, ifMatch: sourceIfMatch)
+        if let updatingMetadata { info.metadata.merge(updatingMetadata) { $1 } }
         if info.size > config.multipart.copyThreshold {
             return try await copyMultipart(from: source, to: destination, source: info, condition: condition)
         }
         var headers = condition?.headers ?? [:]
+        if updatingMetadata != nil {
+            headers.merge(objectHeaders(info.contentType, info.metadata, nil)) { $1 }
+            headers["x-amz-metadata-directive"] = "REPLACE"
+        }
         headers["x-amz-copy-source"] = copySource(source)
         headers["x-amz-copy-source-if-match"] = info.etag
         let response = try await execute(S3Request(method: "PUT", key: destination, headers: headers, timing: .serverWork))

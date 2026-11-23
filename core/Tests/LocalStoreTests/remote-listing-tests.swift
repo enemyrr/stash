@@ -214,4 +214,47 @@ import Testing
 		#expect(try store.children(of: Item.rootId).map(\.name) == ["b"])
 		#expect(try store.item(a.id)?.remoteKey == "b")
 	}
+
+	@Test func remoteDeletionLeavesProtectedItems() throws {
+		let dir = makeDirectory()
+		defer { removeDirectory(dir) }
+		let store = try LocalStore(directory: dir)
+
+		try listRoot(store, [RemoteEntry(key: "a.txt", size: 1, etag: "e1")])
+		let a = try #require(try store.root("a.txt"))
+		try store.applyRemoteListing(Item.rootId, entries: [], listedAt: Date(), protected: [a.id])
+		#expect(try store.root("a.txt") != nil)
+	}
+
+	@Test func listingDoesNotResurrectAFileWithAQueuedDelete() throws {
+		let dir = makeDirectory()
+		defer { removeDirectory(dir) }
+		let store = try LocalStore(directory: dir)
+
+		// The create reached the bucket, but its reply was lost.
+		let file = try store.createFile(in: Item.rootId, name: "a.txt")
+		let upload = try #require(try store.markInFlight(store.nextBatch(limit: 1).map(\.id)).first)
+		try store.fail(upload.id, retryAfter: Date())
+		try store.delete(file.id)
+
+		try listRoot(store, [RemoteEntry(key: "a.txt", size: 1, etag: "e1")])
+		#expect(try store.root("a.txt") == nil)
+	}
+
+	@Test func remoteMtimeAppliesOnlyToTheUnchangedVersion() throws {
+		let dir = makeDirectory()
+		defer { removeDirectory(dir) }
+		let store = try LocalStore(directory: dir)
+
+		try listRoot(store, [RemoteEntry(key: "a.txt", size: 1, etag: "e1"), RemoteEntry(key: "b.txt", size: 1, etag: "e1")])
+		let a = try #require(try store.root("a.txt"))
+		let b = try #require(try store.root("b.txt"))
+		#expect(Set(try store.filesNeedingRemoteMtime(in: Item.rootId).map(\.id)) == [a.id, b.id])
+
+		try store.setRemoteMtime(a.id, etag: "e1", mtime: Date(timeIntervalSince1970: 5))
+		try store.setRemoteMtime(b.id, etag: "e0", mtime: Date(timeIntervalSince1970: 5))
+		#expect(try store.item(a.id)?.mtime == Date(timeIntervalSince1970: 5))
+		#expect(try store.item(b.id)?.mtime != Date(timeIntervalSince1970: 5))
+		#expect(try store.filesNeedingRemoteMtime(in: Item.rootId).map(\.id) == [b.id])
+	}
 }

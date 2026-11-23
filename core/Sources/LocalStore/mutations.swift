@@ -89,6 +89,22 @@ extension LocalStore {
 		}
 	}
 
+	/// Sets the modification time, as `touch` or Finder do. A file that exists remotely gets it there too:
+	/// a queued upload sends it, otherwise a metadata-only `touch` operation does.
+	@discardableResult
+	public func setMtime(_ id: Int64, to mtime: Date) throws -> Item {
+		try withWriter { db in
+			let item = try db.liveItem(id)
+			try db.run("UPDATE items SET mtime = ? WHERE id = ?", mtime.timeIntervalSince1970, id)
+			let hasQueuedUpload = try db.first(
+				"SELECT 1 FROM ops WHERE item_id = ? AND kind = 0 AND state = 0 LIMIT 1", id) { _ in true } != nil
+			if !item.isDirectory, !hasQueuedUpload, try item.remoteKey != nil || db.hasInFlightOps(id) {
+				try db.enqueue(.touch, itemId: id, key: db.intendedKey(item))
+			}
+			return try db.liveItem(id)
+		}
+	}
+
 	/// Renames or moves an item, with its subtree. Replaces an existing file, or an empty directory,
 	/// at the destination.
 	@discardableResult

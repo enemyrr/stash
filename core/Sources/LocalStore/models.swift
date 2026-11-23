@@ -68,8 +68,10 @@ public enum OperationKind: Int, Sendable {
 	/// Server-side rename of `fromKey` to `key`. A key ending in `/` means the whole prefix.
 	/// The source may not exist (an upload that never landed); treat that as success.
 	case move = 2
-	/// Delete `key`. A key ending in `/` means the whole prefix. A missing key is success.
+	/// Delete `key`. A key ending in `/` means the known objects under that prefix. A missing key is success.
 	case delete = 3
+	/// Store the item's mtime in the object's metadata, without sending the content.
+	case touch = 4
 
 	/// Moves and deletes run alone, in queue order.
 	var isBarrier: Bool { self == .move || self == .delete }
@@ -85,6 +87,8 @@ public struct SyncOperation: Sendable, Hashable, Identifiable {
 	public let isInFlight: Bool
 	/// For a claimed upload: a stable copy of the content to send. Deleted on complete or fail.
 	public var contentURL: URL?
+	/// For a claimed upload: the remote version the content was edited from, so a newer remote version is never overwritten.
+	public var baseEtag: String?
 }
 
 public enum ReadResult: Sendable, Equatable {

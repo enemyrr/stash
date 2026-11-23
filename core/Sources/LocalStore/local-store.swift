@@ -123,6 +123,13 @@ public final class LocalStore: Sendable {
 		}
 	}
 
+	/// The remote keys of the item and its descendants, tombstones included.
+	public func remoteKeys(inSubtreeOf id: Int64) throws -> [String] {
+		try withReader { db in
+			try db.subtreeIds(id).compactMap { try db.item($0)?.remoteKey }
+		}
+	}
+
 	/// Returns the slash-separated path from the root, or `""` for the root.
 	public func path(of id: Int64) throws -> String? {
 		try withReader { try $0.path(id) }

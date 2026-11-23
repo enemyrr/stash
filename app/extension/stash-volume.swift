@@ -92,9 +92,11 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 	}
 
 	func deactivate(options: FSDeactivateOptions = [], replyHandler: @escaping ((any Error)?) -> Void) {
-		commitAll()
-		engine.stop()
-		replyHandler(nil)
+		commitAll(logging: "deactivate")
+		Task {
+			await engine.stop()
+			replyHandler(nil)
+		}
 	}
 
 	func mount(options: FSTaskOptions, replyHandler: @escaping ((any Error)?) -> Void) {
@@ -102,7 +104,7 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 	}
 
 	func unmount(replyHandler: @escaping () -> Void) {
-		commitAll()
+		commitAll(logging: "unmount")
 		replyHandler()
 	}
 
@@ -136,10 +138,11 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 		guard let node = item as? StashNode, node !== root, node.virtualContent == nil else { return replyHandler(nil) }
 		do {
 			try node.commit(to: store)
+			nodes.remove(node)
 		} catch {
-			Self.log.error("Dropping unsaved writes on reclaim: \(String(describing: error), privacy: .public)")
+			// The node keeps its buffered writes; the next sync or unmount tries again.
+			Self.log.error("Keeping unsaved writes on reclaim: \(String(describing: error), privacy: .public)")
 		}
-		nodes.remove(node)
 		engine.kick()
 		replyHandler(nil)
 	}
@@ -253,17 +256,23 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 		Task {
 			do {
 				if newAttributes.isValid(.size) {
-					try node.commit(to: store)
 					let size = Int64(newAttributes.size)
 					do {
-						try store.truncate(node.id, to: size)
+						try node.flushed(to: store) { try store.truncate(node.id, to: size) }
 					} catch StoreError.blocksMissing {
 						try await engine.ensureResident(node.id, stall: Self.fetchStall)
-						try store.truncate(node.id, to: size)
+						try node.flushed(to: store) { try store.truncate(node.id, to: size) }
 					}
 					engine.kick()
 				}
-				// Times, mode, and flags are accepted but not stored: LocalStore has no setter for them yet.
+				if newAttributes.isValid(.modifyTime) {
+					// Buffered writes go first, so they don't bump the mtime set here.
+					let time = newAttributes.modifyTime
+					let mtime = Date(timeIntervalSince1970: Double(time.tv_sec) + Double(time.tv_nsec) / 1e9)
+					try node.flushed(to: store) { try store.setMtime(node.id, to: mtime) }
+					engine.kick()
+				}
+				// Other times, mode, and flags are accepted but not stored: LocalStore has no setter for them yet.
 				newAttributes.consumedAttributes = [
 					.size, .mode, .uid, .gid, .flags, .accessTime, .modifyTime, .changeTime, .birthTime, .backupTime, .addedTime,
 				]
@@ -355,13 +364,11 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 		guard let node = item as? StashNode, !node.isDirectory, node.virtualContent == nil else {
 			return replyHandler(0, POSIXError(.EISDIR))
 		}
-		guard node.buffer(contents, at: Int64(offset)) else { return replyHandler(contents.count, nil) }
 		do {
-			try node.commit(to: store)
+			try node.write(contents, at: Int64(offset), to: store)
 			engine.kick()
 			replyHandler(contents.count, nil)
 		} catch {
-			node.discardPending()
 			replyHandler(0, Self.posixError(error))
 		}
 	}
@@ -410,7 +417,7 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 			attributes.parentID = root.fileID
 			return attributes
 		}
-		return makeAttributes(try liveItem(node.id), pendingEnd: node.pendingEnd)
+		return try node.withPendingEnd { try makeAttributes(liveItem(node.id), pendingEnd: $0) }
 	}
 
 	private func makeAttributes(_ item: Item, pendingEnd: Int64) -> FSItem.Attributes {
@@ -445,13 +452,16 @@ final class StashVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperat
 	}
 
 	@discardableResult
-	private func commitAll() -> (any Error)? {
+	private func commitAll(logging context: StaticString? = nil) -> (any Error)? {
 		var firstError: (any Error)?
 		for node in nodes.all {
 			do {
 				try node.commit(to: store)
 			} catch {
 				firstError = firstError ?? error
+				if let context {
+					Self.log.error("Unsaved writes on \(context, privacy: .public): \(String(describing: error), privacy: .public)")
+				}
 			}
 		}
 		engine.kick()

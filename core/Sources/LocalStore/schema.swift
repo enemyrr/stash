@@ -75,6 +75,10 @@ enum Schema {
 		INSERT INTO items (id, parent_id, name, remote_name, is_dir, mtime, ctime, mode, state, remote_key)
 		VALUES (1, NULL, '', '', 1, 0, 0, 493, 0, '');
 		""",
+		"""
+		-- Remote version whose metadata mtime is known: read with HEAD, or sent with our own upload.
+		ALTER TABLE items ADD COLUMN meta_etag TEXT;
+		""",
 	]
 
 	static func migrate(_ db: Connection) throws {

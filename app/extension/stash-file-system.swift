@@ -31,10 +31,14 @@ final class StashFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 		}
 	}
 
+	/// Waits for running uploads, so none lands after the store is opened again.
 	func unloadResource(resource: FSResource, options: FSTaskOptions, replyHandler: @escaping ((any Error)?) -> Void) {
-		volume?.engine.stop()
+		let engine = volume?.engine
 		volume = nil
-		replyHandler(nil)
+		Task {
+			await engine?.stop()
+			replyHandler(nil)
+		}
 	}
 
 	private static func drive(for resource: FSResource) -> DriveConfig? {
